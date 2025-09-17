@@ -1,165 +1,191 @@
-# app.py — Streamlit + TAGO(국토부) 버스 조회 (진단/안정화 패치 포함)
-import os
-import re
-from datetime import date
-from urllib.parse import urlencode
-
-import certifi
-import pandas as pd
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# ====== 팝업(팝오버/모달) 터미널 피커 ======
 import streamlit as st
+import pandas as pd
+import requests, certifi
+from urllib.parse import urlencode
+import os, re
 
-# =========================
-# 기본 설정
-# =========================
-st.set_page_config(page_title="시외/고속버스 시간표 & 요금", page_icon="🚌", layout="wide")
-st.title("🚌 시외/고속버스 시간표 & 요금 (국토부 TAGO)")
-st.caption("• 당일 배차 중심 데이터 · 터미널 검색 → 출/도착 선택 → 조회\n• 네트워크/SSL/오탈자 진단 로그를 화면에 표시하도록 패치됨")
+BASE = "https://apis.data.go.kr"
 
-# API 키 (Secrets 또는 환경변수)
-API_KEY = st.secrets.get("DATA_GO_KR_KEY", os.getenv("DATA_GO_KR_KEY", ""))
-
-if not API_KEY:
-    st.warning("⚠️ 먼저 data.go.kr 서비스키를 Streamlit Secrets의 `DATA_GO_KR_KEY` 로 등록하세요.")
-    st.stop()
-
-# =========================
-# TAGO 엔드포인트(필요시 교체)
-# =========================
-BASE = "https://apis.data.go.kr"  # 반드시 https + 정확한 도메인
-# 아래 경로/오퍼레이션명은 활용가이드대로 확인해서 필요시 수정
+# 서비스 경로/오퍼레이션 (질문자 샘플에 맞춤)
 SERVICE_PATH_SUBURBS = "/1613000/SuburbsBusInfoService"
+OP_SUB_TERMINALS = "getSuberbsBusTrminlList"         # 시외 터미널 목록
+OP_SUB_ALLOC     = "getStrtpntAlocFndSuberbsInfo"    # 시외 배차(참고)
+
 SERVICE_PATH_EXPRESS = "/1613000/ExpBusInfoService"
+OP_EXP_TERMINALS = "getExpBusTrminlList"             # 고속 터미널 목록
+OP_EXP_ALLOC     = "getStrtpntAlocFndExpbusInfo"     # 고속 배차(참고)
 
-# 흔히 쓰이는 오퍼레이션명 (문서에서 확인 후 필요시 수정)
-OP_SUB_TERMINALS = "getSuberbsBusTrminlList"        # 시외 터미널 목록
-OP_SUB_ALLOC     = "getStrtpntAlocFndSuberbsInfo"   # 시외 출/도착 배차
-OP_EXP_TERMINALS = "getExpBusTrminlList"            # 고속 터미널 목록
-OP_EXP_ALLOC     = "getStrtpntAlocFndExpbusInfo"    # 고속 출/도착 배차
+# 두 개 API 키 (secrets 사용 권장)
+SUBURBS_API_KEY = st.secrets.get("SUBURBS_API_KEY", os.getenv("SUBURBS_API_KEY", ""))
+EXPRESS_API_KEY = st.secrets.get("EXPRESS_API_KEY", os.getenv("EXPRESS_API_KEY", ""))
 
-# =========================
-# HTTP 세션(재시도/UA/인증서 번들)
-# =========================
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Streamlit; bus-app)"})
-retries = Retry(
-    total=3,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods={"GET", "POST"},
-    raise_on_status=False,
-)
-SESSION.mount("https://", HTTPAdapter(max_retries=retries))
-SESSION.mount("http://", HTTPAdapter(max_retries=retries))
+def _mask(url: str, key: str) -> str:
+    return url.replace(key, "***")
 
-def mask_key(url: str) -> str:
-    return re.sub(r"(serviceKey=)[^&]+", r"\1***MASKED***", url)
-
-def api_get_json(base_url: str, params: dict, *, allow_redirects: bool):
-    """완성 URL 로깅 + 인증서 번들 지정 + 리디렉트 제어."""
-    q = params.copy()
-    q["serviceKey"] = API_KEY
-    q.setdefault("_type", "json")
-    full_url = f"{base_url}?{urlencode(q, doseq=True)}"
-
-    st.write("🔎 요청 URL (키 마스킹):", mask_key(full_url))
+def call_api(base_path, op, params, api_key):
+    url = f"{BASE}{base_path}/{op}"
+    q = {**params, "serviceKey": api_key, "_type": "json"}
+    full = f"{url}?{urlencode(q)}"
+    # 디버그: 키 마스킹된 URL 출력
+    st.caption("요청: " + _mask(full, api_key))
+    r = requests.get(full, timeout=15, verify=certifi.where())
+    r.raise_for_status()
     try:
-        r = SESSION.get(
-            full_url,
-            timeout=20,
-            allow_redirects=allow_redirects,
-            verify=certifi.where(),  # 인증서 번들 명시
-        )
-        st.write("↩️ HTTP 상태:", r.status_code)
-        if not allow_redirects and 300 <= r.status_code < 400:
-            st.warning(f"리디렉트 감지: {r.headers.get('Location')}")
-        r.raise_for_status()
-        try:
-            return r.json()
-        except Exception:
-            return {"raw": r.text}
-    except requests.exceptions.SSLError as e:
-        st.error("❌ SSL 오류(인증서/리디렉트/시간 동기화 문제 가능). 아래 예외 요약을 확인하세요.")
-        st.exception(e)
-        raise
-    except requests.exceptions.RequestException as e:
-        st.error("❌ 네트워크/HTTP 오류. URL/오퍼레이션명/파라미터를 확인하세요.")
-        st.exception(e)
-        raise
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
 
-def normalize_items(top: dict):
-    """표준 응답(response>body>items>item) 파싱."""
+def parse_items(payload):
     try:
-        items = top["response"]["body"]["items"]["item"]
+        items = payload["response"]["body"]["items"]["item"]
         if isinstance(items, dict):
             items = [items]
         return items
     except Exception:
         return []
 
-def to_time_str(s):
-    """'0550' or '055000' → '05:50' / '05:50:00'"""
-    if not s:
-        return ""
-    s = str(s)
-    if len(s) == 4:
-        return f"{s[:2]}:{s[2:]}"
-    if len(s) == 6:
-        return f"{s[:2]}:{s[2:4]}:{s[4:]}"
-    return s
+def terminal_picker(mode_key: str, title: str, button_label: str, state_key_out: str):
+    """
+    mode_key: "suburbs" | "express"
+    title: 팝업 제목
+    button_label: 버튼 문구 (예: '출발 터미널 찾기')
+    state_key_out: 선택 ID를 저장할 세션 키 (예: 'dep_id' 또는 'arr_id')
+    """
 
-def pretty_money(v):
-    try:
-        return f"{int(v):,}원"
-    except:
-        return v or ""
+    # ---- 팝오버(신버전) 있으면 사용 ----
+    has_popover = hasattr(st, "popover")
 
-# =========================
-# UI — 서비스/날짜/등급
-# =========================
-cols = st.columns([1.1, 1, 1])
-with cols[0]:
-    mode = st.radio("서비스", ["시외(Suburbs)", "고속(Express)"], horizontal=True)
-    is_suburbs = mode.startswith("시외")
-with cols[1]:
-    pick_date = st.date_input("출발 날짜", value=date.today(), format="YYYY-MM-DD")
-with cols[2]:
-    bus_grade = st.selectbox("버스등급(옵션)", ["(전체)", "일반", "우등", "프리미엄", "심야"], index=0)
+    if has_popover:
+        with st.popover(button_label, use_container_width=True):
+            st.markdown(f"#### {title}")
+            # 검색 입력
+            kw = st.text_input("터미널명 (예: 광주, 동서울, 해남 등)", key=f"{state_key_out}_kw", value="")
+            city = st.text_input("도시코드 (선택)", key=f"{state_key_out}_city", value="")
+            col1, col2 = st.columns([1,1])
+            with col1:
+                page = st.number_input("pageNo", min_value=1, value=1, step=1, key=f"{state_key_out}_page")
+            with col2:
+                rows = st.number_input("numOfRows", min_value=10, max_value=1000, value=200, step=10, key=f"{state_key_out}_rows")
 
-st.divider()
-st.subheader("① 터미널 검색")
+            if st.button("검색", use_container_width=True, key=f"{state_key_out}_search"):
+                base_path = SERVICE_PATH_SUBURBS if mode_key=="suburbs" else SERVICE_PATH_EXPRESS
+                op        = OP_SUB_TERMINALS if mode_key=="suburbs" else OP_EXP_TERMINALS
+                api_key   = SUBURBS_API_KEY if mode_key=="suburbs" else EXPRESS_API_KEY
+                if not api_key:
+                    st.error("해당 서비스의 API 키가 설정되지 않았습니다.")
+                else:
+                    params = {"pageNo": page, "numOfRows": rows}
+                    if kw:   params["terminalNm"] = kw
+                    if city: params["cityCode"]   = city
+                    data = call_api(base_path, op, params, api_key)
+                    items = parse_items(data)
+                    df = pd.DataFrame(items)
 
-# =========================
-# 출발/도착 터미널 검색
-# =========================
-left, right = st.columns(2)
+                    if df.empty:
+                        st.warning("검색 결과가 없습니다.")
+                    else:
+                        # 가장 가능성 높은 컬럼 정리
+                        id_col = None
+                        name_col = None
+                        city_col = None
+                        for c in df.columns:
+                            cl = c.lower()
+                            if cl in ("terminalid","terminal_id","terminalcd","terminalcode"):
+                                id_col = c
+                            if cl in ("terminalnm","terminalname","terminal_nm"):
+                                name_col = c
+                            if cl in ("citycode","city_cd","citycodevalue"):
+                                city_col = c
 
-with left:
-    dep_kw = st.text_input("출발 터미널명", value="광주")
-    if st.button("출발지 검색", use_container_width=True):
-        base = BASE + (SERVICE_PATH_SUBURBS if is_suburbs else SERVICE_PATH_EXPRESS)
-        op   = OP_SUB_TERMINALS if is_suburbs else OP_EXP_TERMINALS
-        url  = f"{base}/{op}"
-        # 먼저 리디렉트 여부 점검
-        data = api_get_json(url, {"pageNo":1, "numOfRows":500, "terminalNm":dep_kw}, allow_redirects=False)
-        st.write("응답 상위 키:", list(data.keys()))
-        items = normalize_items(data)
-        dep_df = pd.DataFrame(items)
-        st.session_state["dep_df"] = dep_df
-        if dep_df.empty:
-            st.warning("결과가 비어있습니다. (엔드포인트/파라미터/리디렉트/키 문제 가능)")
-        else:
-            st.dataframe(dep_df, use_container_width=True, height=260)
+                        # 표시용 테이블(읽기 전용)
+                        show = df.copy()
+                        st.dataframe(show, use_container_width=True, height=300)
 
-with right:
-    arr_kw = st.text_input("도착 터미널명", value="해남")
-    if st.button("도착지 검색", use_container_width=True):
-        base = BASE + (SERVICE_PATH_SUBURBS if is_suburbs else SERVICE_PATH_EXPRESS)
-        op   = OP_SUB_TERMINALS if is_suburbs else OP_EXP_TERMINALS
-        url  = f"{base}/{op}"
-        data = api_get_json(url, {"pageNo":1, "numOfRows":500, "terminalNm":arr_kw}, allow_redirects=False)
-        st.write("응답 상위 키:", list(data.keys()))
-        items = normalize_items(data)
+                        # 선택 위젯
+                        if id_col:
+                            choices = [f"{r[id_col]} · {r.get(name_col,'')}" for _, r in df.iterrows()]
+                            pick = st.selectbox("선택", choices, key=f"{state_key_out}_pick")
+                            # ID만 추출
+                            sel_id = pick.split("·")[0].strip()
+                            if st.button("이 터미널 사용", type="primary", key=f"{state_key_out}_use"):
+                                st.session_state[state_key_out] = sel_id
+                                st.success(f"선택됨: {sel_id}")
+                        else:
+                            st.info("ID 컬럼을 찾지 못했습니다. 응답 스키마를 확인하세요.")
+    else:
+        # ---- 구버전 폴백: CSS 오버레이 모달 ----
+        key_flag = f"show_modal_{state_key_out}"
+        if st.button(button_label, use_container_width=True, key=f"{state_key_out}_open"):
+            st.session_state[key_flag] = True
 
+        if st.session_state.get(key_flag):
+            # 오버레이 스타일
+            st.markdown("""
+            <style>
+            ._overlay {
+                position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+                display: flex; align-items: center; justify-content: center; z-index: 9999;
+            }
+            ._modal {
+                width: min(900px, 95vw); max-height: 85vh; overflow: auto;
+                background: white; padding: 1.25rem; border-radius: 12px;
+                box-shadow: 0 10px 30px rgba(0,0,0,.2);
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            # 컨테이너
+            with st.container():
+                st.markdown('<div class="_overlay"><div class="_modal">', unsafe_allow_html=True)
+                st.markdown(f"#### {title}")
+
+                kw = st.text_input("터미널명 (예: 광주, 동서울, 해남 등)", key=f"{state_key_out}_kw_fb", value="")
+                city = st.text_input("도시코드 (선택)", key=f"{state_key_out}_city_fb", value="")
+                col1, col2 = st.columns([1,1])
+                with col1:
+                    page = st.number_input("pageNo", min_value=1, value=1, step=1, key=f"{state_key_out}_page_fb")
+                with col2:
+                    rows = st.number_input("numOfRows", min_value=10, max_value=1000, value=200, step=10, key=f"{state_key_out}_rows_fb")
+
+                if st.button("검색", use_container_width=True, key=f"{state_key_out}_search_fb"):
+                    base_path = SERVICE_PATH_SUBURBS if mode_key=="suburbs" else SERVICE_PATH_EXPRESS
+                    op        = OP_SUB_TERMINALS if mode_key=="suburbs" else OP_EXP_TERMINALS
+                    api_key   = SUBURBS_API_KEY if mode_key=="suburbs" else EXPRESS_API_KEY
+                    if not api_key:
+                        st.error("해당 서비스의 API 키가 설정되지 않았습니다.")
+                    else:
+                        params = {"pageNo": page, "numOfRows": rows}
+                        if kw:   params["terminalNm"] = kw
+                        if city: params["cityCode"]   = city
+                        data = call_api(base_path, op, params, api_key)
+                        items = parse_items(data)
+                        df = pd.DataFrame(items)
+
+                        if df.empty:
+                            st.warning("검색 결과가 없습니다.")
+                        else:
+                            id_col = None
+                            name_col = None
+                            for c in df.columns:
+                                cl = c.lower()
+                                if cl in ("terminalid","terminal_id","terminalcd","terminalcode"):
+                                    id_col = c
+                                if cl in ("terminalnm","terminalname","terminal_nm"):
+                                    name_col = c
+                            st.dataframe(df, use_container_width=True, height=300)
+                            if id_col:
+                                choices = [f"{r[id_col]} · {r.get(name_col,'')}" for _, r in df.iterrows()]
+                                pick = st.selectbox("선택", choices, key=f"{state_key_out}_pick_fb")
+                                sel_id = pick.split("·")[0].strip()
+                                if st.button("이 터미널 사용", type="primary", key=f"{state_key_out}_use_fb"):
+                                    st.session_state[state_key_out] = sel_id
+                                    st.session_state[key_flag] = False
+                                    st.success(f"선택됨: {sel_id}")
+                            else:
+                                st.info("ID 컬럼을 찾지 못했습니다. 응답 스키마를 확인하세요.")
+
+                if st.button("닫기", key=f"{state_key_out}_close"):
+                    st.session_state[key_flag] = False
+
+                st.markdown('</div></div>', unsafe_allow_html=True)
+# ====== /팝업 ======
